@@ -93,6 +93,8 @@ select{width:100%;padding:9px 10px;border-radius:10px;border:1px solid var(--lin
 .finger b{width:46px;height:46px;border-radius:50%;border:3px solid var(--accent);display:grid;place-items:center;font-size:1.5rem;color:var(--fg)}
 .cue-next{color:var(--muted);font-size:1.05rem}
 .cue-next b{color:var(--fg)}
+.hearing{font-size:.95rem;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:3px 12px}
+.hearing b{color:var(--fg)}
 .cue-msg{grid-column:1/-1;margin:4px 0 0;font-size:1.05rem;min-height:1.5em}
 .cue-msg.bad{color:var(--bad)}
 .beats{display:flex;gap:8px}
@@ -235,6 +237,7 @@ dialog::backdrop{background:rgba(10,14,22,.55)}
         <div class="cue-side">
           <div id="cueFinger" class="finger"></div>
           <div id="cueNext" class="cue-next"></div>
+          <div id="hearing" class="hearing">Oyendo: <b>–</b></div>
           <div id="beats" class="beats" hidden><i></i><i></i><i></i><i></i></div>
         </div>
         <p id="cueMsg" class="cue-msg"></p>
@@ -322,8 +325,10 @@ const SHARP_SPELL=[[0,0],[0,1],[1,0],[1,1],[2,0],[3,0],[3,1],[4,0],[4,1],[5,0],[
 
 /* ---------- settings ---------- */
 const DEF={mode:'practice',root:0,type:'major',octaves:1,dir:'updown',startOct:4,metro:false,bpm:60,npb:2,
-  autoTempo:true,strict:false,latency:50,gate:0.012,notation:'es',input:'mic'};
-const S=Object.assign({},DEF,store.get('escalas:settings',{}));
+  autoTempo:true,strict:false,latency:50,gate:0.004,notation:'es',input:'mic'};
+const saved=store.get('escalas:settings',{});
+if(!saved.v||saved.v<2) delete saved.gate;
+const S=Object.assign({},DEF,saved,{v:2});
 const save=()=>store.set('escalas:settings',S);
 let records=store.get('escalas:records',{});
 
@@ -420,8 +425,11 @@ async function startMic(){
   catch(e){ setMsg('No se pudo usar el micrófono. Revisa el permiso en Chrome (ícono junto a la dirección) y vuelve a intentarlo.',true); return false; }
   const src=c.createMediaStreamSource(stream);
   analyser=c.createAnalyser(); analyser.fftSize=2048; src.connect(analyser);
+  const sink=c.createGain(); sink.gain.value=0; analyser.connect(sink); sink.connect(c.destination);
+  try{await c.resume();}catch(e){}
   micBuf=new Float32Array(2048); micOn=true;
   requestWake(); updateMicUI(); requestAnimationFrame(loop);
+  if(!store.get('escalas:calibrated',false)) autoCalibrate();
   return true;
 }
 async function requestWake(){try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch(e){}}
@@ -436,7 +444,7 @@ function yin(buf,sr){
     run+=s; d[tau]=run>0?s*tau/run:1;
   }
   let tau=-1;
-  for(let t=tMin;t<=tMax;t++){ if(d[t]<0.15){ while(t+1<=tMax&&d[t+1]<d[t]) t++; tau=t; break; } }
+  for(let t=tMin;t<=tMax;t++){ if(d[t]<0.2){ while(t+1<=tMax&&d[t+1]<d[t]) t++; tau=t; break; } }
   if(tau<0) return null;
   let bt=tau;
   if(tau>1&&tau<tMax){const a=d[tau-1],b=d[tau],c=d[tau+1],den=a+c-2*b; if(den) bt=tau+(a-c)/(2*den);}
@@ -455,17 +463,37 @@ function loop(){
   tr.env=tr.env*0.75+rms*0.25;
   const t=ctx.currentTime;
   if(S.input!=='mic'||t<muteUntil){resetTracker();tr.cur=null;return;}
-  if(rms<S.gate){ tr.silent++; resetTracker(); if(tr.silent>5) tr.cur=null; if(S.mode==='free'&&tr.silent===8) showFree(null); return; }
+  if(rms<S.gate){ tr.silent++; resetTracker(); if(tr.silent===6) hearing(null); if(tr.silent>5) tr.cur=null; if(S.mode==='free'&&tr.silent===8) showFree(null); return; }
   const r=yin(micBuf,ctx.sampleRate);
-  if(!r||r.clarity<0.82){ tr.cand=null; tr.count=0; return; }
+  if(!r||r.clarity<0.72){ tr.cand=null; tr.count=0; hearing(null); return; }
   tr.silent=0;
   const mf=69+12*Math.log2(r.f/440), m=Math.round(mf);
   if(S.mode==='free') showFree(m,(mf-m)*100,r.f);
   if(m===tr.cand) tr.count++; else {tr.cand=m;tr.count=1;tr.candT=t;}
-  if(tr.count>=3&&(m!==tr.cur||tr.onset)){
+  hearing(m);
+  if(tr.count>=2&&(m!==tr.cur||tr.onset)){
     tr.cur=m; tr.onset=false;
     handleNote(m,tr.candT-(1024/ctx.sampleRate)-S.latency/1000,'mic');
   }
+}
+let hearLast=null;
+function hearing(m){
+  if(m===hearLast) return; hearLast=m;
+  const el=$('#hearing'); if(!el) return;
+  if(m==null){el.innerHTML='Oyendo: <b>–</b>';return;}
+  const s=spellMidi(m); el.innerHTML=`Oyendo: <b>${s.name}${s.oct}</b>`;
+}
+function autoCalibrate(){
+  calib.vals=[]; calib.on=true;
+  setMsg('Ajustando el micrófono al ruido del ambiente. Un segundo de silencio…');
+  setTimeout(()=>{
+    calib.on=false; const v=calib.vals.slice().sort((a,b)=>a-b);
+    const ref=v.length?v[Math.floor(v.length*0.9)]:0.002;
+    S.gate=Math.max(0.0015,Math.min(0.03,ref*2.5)); save();
+    store.set('escalas:calibrated',true);
+    const r=$('#sensRange'); if(r) r.value=sensFromGate(S.gate);
+    refresh();
+  },1200);
 }
 function showLevel(rms){
   const toPct=v=>Math.max(0,Math.min(100,(20*Math.log10(v+1e-9)+60)/60*100));
@@ -765,8 +793,8 @@ $('#fsBtn').onclick=()=>{ const d=document.documentElement; try{ if(document.ful
 const dlg=$('#setDlg');
 function openSettings(){ if(typeof dlg.showModal==='function') dlg.showModal(); else dlg.setAttribute('open',''); if(S.input==='midi') enableMidi(); }
 $('#setBtn').onclick=openSettings;
-const gateFromSens=v=>0.08*Math.pow(0.025,v/100);
-const sensFromGate=g=>Math.round(Math.log(g/0.08)/Math.log(0.025)*100);
+const gateFromSens=v=>0.05*Math.pow(0.01,v/100);
+const sensFromGate=g=>Math.max(0,Math.min(100,Math.round(Math.log(g/0.05)/Math.log(0.01)*100)));
 $('#sensRange').value=sensFromGate(S.gate);
 $('#sensRange').oninput=e=>{S.gate=gateFromSens(+e.target.value);save();};
 $('#strictChk').checked=S.strict; $('#strictChk').onchange=e=>{S.strict=e.target.checked;save();updateRecord();};
@@ -778,7 +806,7 @@ $('#calBtn').onclick=async()=>{
   setTimeout(()=>{
     calib.on=false; const v=calib.vals.slice().sort((a,b)=>a-b);
     const ref=v.length?v[Math.floor(v.length*0.9)]:0.004;
-    S.gate=Math.max(0.002,Math.min(0.08,ref*2.5)); save();
+    S.gate=Math.max(0.0015,Math.min(0.03,ref*2.5)); save(); store.set('escalas:calibrated',true);
     $('#sensRange').value=sensFromGate(S.gate); $('#calTxt').textContent='Listo, umbral ajustado.'; updateMicUI();
   },2000);
 };
