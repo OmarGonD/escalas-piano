@@ -95,6 +95,8 @@ select{width:100%;padding:9px 10px;border-radius:10px;border:1px solid var(--lin
 .cue-next b{color:var(--fg)}
 .hearing{font-size:.95rem;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:3px 12px}
 .hearing b{color:var(--fg)}
+.diag{grid-column:1/-1;margin:0;font-size:.8rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.ver{font-size:.75rem;color:var(--muted);font-weight:600}
 .cue-msg{grid-column:1/-1;margin:4px 0 0;font-size:1.05rem;min-height:1.5em}
 .cue-msg.bad{color:var(--bad)}
 .beats{display:flex;gap:8px}
@@ -182,7 +184,7 @@ dialog::backdrop{background:rgba(10,14,22,.55)}
 <body>
 <div class="app">
   <header class="top">
-    <div class="brand"><span class="glyph" aria-hidden="true">𝄞</span><h1>Escalas</h1></div>
+    <div class="brand"><span class="glyph" aria-hidden="true">𝄞</span><h1>Escalas</h1><span class="ver">v3</span></div>
     <div class="mic">
       <button id="micBtn" class="btn">Activar micrófono</button>
       <div class="meter" title="Nivel del micrófono (la raya es el umbral)"><div id="meterFill"></div><div id="meterGate"></div></div>
@@ -241,6 +243,7 @@ dialog::backdrop{background:rgba(10,14,22,.55)}
           <div id="beats" class="beats" hidden><i></i><i></i><i></i><i></i></div>
         </div>
         <p id="cueMsg" class="cue-msg"></p>
+        <p id="diag" class="diag"></p>
         <div id="tuner" class="tuner" hidden>
           <div class="tuner-scale"><div id="needle"></div></div>
           <div id="tunerTxt" class="tuner-txt">Toca una nota y mantenla.</div>
@@ -271,8 +274,9 @@ dialog::backdrop{background:rgba(10,14,22,.55)}
       <span>Sensibilidad del micrófono</span>
       <input type="range" id="sensRange" min="0" max="100" step="1">
       <div class="inline"><button type="button" class="btn" id="calBtn">Calibrar ruido de fondo</button><span class="hint" id="calTxt"></span></div>
-      <p class="hint">Si detecta notas cuando no tocas, baja la sensibilidad o calibra en silencio. Si no reacciona, súbela o acerca la tablet a los parlantes del teclado.</p>
+      <p class="hint">La app se adapta sola al ruido del ambiente. Si detecta notas cuando no tocas, baja la sensibilidad; si no reacciona, súbela o acerca la tablet a los parlantes del teclado.</p>
     </div>
+    <label class="check"><input type="checkbox" id="diagChk"> Mostrar datos del micrófono (diagnóstico)</label>
     <label class="check"><input type="checkbox" id="strictChk"> Exigir la octava exacta</label>
     <p class="hint">Desactivado, basta con acertar el nombre de la nota. El micrófono a veces confunde octavas, así que conviene dejarlo apagado al principio.</p>
     <div class="field">
@@ -325,10 +329,10 @@ const SHARP_SPELL=[[0,0],[0,1],[1,0],[1,1],[2,0],[3,0],[3,1],[4,0],[4,1],[5,0],[
 
 /* ---------- settings ---------- */
 const DEF={mode:'practice',root:0,type:'major',octaves:1,dir:'updown',startOct:4,metro:false,bpm:60,npb:2,
-  autoTempo:true,strict:false,latency:50,gate:0.004,notation:'es',input:'mic'};
+  autoTempo:true,strict:false,latency:50,sens:2,notation:'es',input:'mic',diag:true};
 const saved=store.get('escalas:settings',{});
-if(!saved.v||saved.v<2) delete saved.gate;
-const S=Object.assign({},DEF,saved,{v:2});
+delete saved.gate;
+const S=Object.assign({},DEF,saved,{v:3});
 const save=()=>store.set('escalas:settings',S);
 let records=store.get('escalas:records',{});
 
@@ -424,12 +428,14 @@ async function startMic(){
   try{ stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}}); }
   catch(e){ setMsg('No se pudo usar el micrófono. Revisa el permiso en Chrome (ícono junto a la dirección) y vuelve a intentarlo.',true); return false; }
   const src=c.createMediaStreamSource(stream);
-  analyser=c.createAnalyser(); analyser.fftSize=2048; src.connect(analyser);
+  analyser=c.createAnalyser(); analyser.fftSize=2048;
+  const hp=c.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=60;
+  const lpf=c.createBiquadFilter(); lpf.type='lowpass'; lpf.frequency.value=2500; lpf.Q.value=0.7;
+  src.connect(hp); hp.connect(lpf); lpf.connect(analyser);
   const sink=c.createGain(); sink.gain.value=0; analyser.connect(sink); sink.connect(c.destination);
   try{await c.resume();}catch(e){}
   micBuf=new Float32Array(2048); micOn=true;
   requestWake(); updateMicUI(); requestAnimationFrame(loop);
-  if(!store.get('escalas:calibrated',false)) autoCalibrate();
   return true;
 }
 async function requestWake(){try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch(e){}}
@@ -451,30 +457,50 @@ function yin(buf,sr){
   return {f:sr/bt,clarity:1-d[tau]};
 }
 function resetTracker(){tr.cand=null;tr.count=0;tr.onset=false;}
-function loop(){
-  if(!micOn) return;
-  requestAnimationFrame(loop);
-  const now=performance.now(); if(now-tr.last<22) return; tr.last=now;
-  analyser.getFloatTimeDomainData(micBuf);
-  let rms=0; for(let i=0;i<micBuf.length;i++) rms+=micBuf[i]*micBuf[i]; rms=Math.sqrt(rms/micBuf.length);
-  showLevel(rms);
-  if(calib.on){calib.vals.push(rms);return;}
-  if(rms>tr.env*1.8&&rms>S.gate*1.5) tr.onset=true;
+/* adaptive noise floor: works with any mic gain, no fixed threshold */
+const nf={v:0,init:false};
+const gateNow=()=>Math.max(2e-5,nf.v*S.sens);
+const diag={rms:0,f:0,clar:0,last:0};
+function processFrame(buf,sr,t){
+  let rms=0; for(let i=0;i<buf.length;i++) rms+=buf[i]*buf[i]; rms=Math.sqrt(rms/buf.length);
+  if(!nf.init){nf.v=rms;nf.init=true;}
+  else if(rms<nf.v) nf.v=nf.v*0.6+rms*0.4; else nf.v=Math.min(nf.v*1.003,rms);
+  diag.rms=rms;
+  const gate=gateNow();
+  if(rms>tr.env*1.6&&rms>gate) tr.onset=true;
   tr.env=tr.env*0.75+rms*0.25;
-  const t=ctx.currentTime;
-  if(S.input!=='mic'||t<muteUntil){resetTracker();tr.cur=null;return;}
-  if(rms<S.gate){ tr.silent++; resetTracker(); if(tr.silent===6) hearing(null); if(tr.silent>5) tr.cur=null; if(S.mode==='free'&&tr.silent===8) showFree(null); return; }
-  const r=yin(micBuf,ctx.sampleRate);
-  if(!r||r.clarity<0.72){ tr.cand=null; tr.count=0; hearing(null); return; }
+  if(S.input!=='mic'||t<muteUntil){resetTracker();tr.cur=null;return null;}
+  const r=rms>gate*0.5?yin(buf,sr):null;
+  diag.f=r?r.f:0; diag.clar=r?r.clarity:0;
+  const voiced=r&&((rms>=gate&&r.clarity>=0.7)||(r.clarity>=0.9&&rms>=gate*0.5));
+  if(!voiced){
+    tr.silent++; tr.cand=null; tr.count=0;
+    if(tr.silent===6){hearing(null); if(S.mode==='free') showFree(null);}
+    if(tr.silent>6){tr.cur=null;tr.onset=false;}
+    return null;
+  }
   tr.silent=0;
   const mf=69+12*Math.log2(r.f/440), m=Math.round(mf);
+  if(m<21||m>108) return null;
   if(S.mode==='free') showFree(m,(mf-m)*100,r.f);
   if(m===tr.cand) tr.count++; else {tr.cand=m;tr.count=1;tr.candT=t;}
   hearing(m);
   if(tr.count>=2&&(m!==tr.cur||tr.onset)){
     tr.cur=m; tr.onset=false;
-    handleNote(m,tr.candT-(1024/ctx.sampleRate)-S.latency/1000,'mic');
+    return {m,t:tr.candT-(buf.length/2/sr)-S.latency/1000};
   }
+  return null;
+}
+function loop(){
+  if(!micOn) return;
+  requestAnimationFrame(loop);
+  const now=performance.now(); if(now-tr.last<20) return; tr.last=now;
+  analyser.getFloatTimeDomainData(micBuf);
+  if(calib.on){let q=0;for(let i=0;i<micBuf.length;i++)q+=micBuf[i]*micBuf[i];calib.vals.push(Math.sqrt(q/micBuf.length));return;}
+  const ev=processFrame(micBuf,ctx.sampleRate,ctx.currentTime);
+  showLevel(diag.rms);
+  if(now-diag.last>250){diag.last=now;showDiag();}
+  if(ev) handleNote(ev.m,ev.t,'mic');
 }
 let hearLast=null;
 function hearing(m){
@@ -483,23 +509,16 @@ function hearing(m){
   if(m==null){el.innerHTML='Oyendo: <b>–</b>';return;}
   const s=spellMidi(m); el.innerHTML=`Oyendo: <b>${s.name}${s.oct}</b>`;
 }
-function autoCalibrate(){
-  calib.vals=[]; calib.on=true;
-  setMsg('Ajustando el micrófono al ruido del ambiente. Un segundo de silencio…');
-  setTimeout(()=>{
-    calib.on=false; const v=calib.vals.slice().sort((a,b)=>a-b);
-    const ref=v.length?v[Math.floor(v.length*0.9)]:0.002;
-    S.gate=Math.max(0.0015,Math.min(0.03,ref*2.5)); save();
-    store.set('escalas:calibrated',true);
-    const r=$('#sensRange'); if(r) r.value=sensFromGate(S.gate);
-    refresh();
-  },1200);
+const dB=v=>Math.round(20*Math.log10(v+1e-9));
+function showDiag(){
+  const el=$('#diag'); if(!el||el.hidden) return;
+  el.textContent=`Audio ${ctx?ctx.state:'–'} · ${ctx?ctx.sampleRate:0} Hz · nivel ${dB(diag.rms)} dB · umbral ${dB(gateNow())} dB · tono ${diag.f?diag.f.toFixed(1)+' Hz':'–'} · claridad ${diag.clar.toFixed(2)}`;
 }
 function showLevel(rms){
-  const toPct=v=>Math.max(0,Math.min(100,(20*Math.log10(v+1e-9)+60)/60*100));
+  const toPct=v=>Math.max(0,Math.min(100,(20*Math.log10(v+1e-9)+90)/80*100));
   $('#meterFill').style.width=toPct(rms)+'%';
-  $('#meterFill').style.background=rms>=S.gate?'var(--ok)':'var(--muted)';
-  $('#meterGate').style.left=toPct(S.gate)+'%';
+  $('#meterFill').style.background=rms>=gateNow()?'var(--ok)':'var(--muted)';
+  $('#meterGate').style.left=toPct(gateNow())+'%';
 }
 function updateMicUI(){
   const b=$('#micBtn');
@@ -793,10 +812,12 @@ $('#fsBtn').onclick=()=>{ const d=document.documentElement; try{ if(document.ful
 const dlg=$('#setDlg');
 function openSettings(){ if(typeof dlg.showModal==='function') dlg.showModal(); else dlg.setAttribute('open',''); if(S.input==='midi') enableMidi(); }
 $('#setBtn').onclick=openSettings;
-const gateFromSens=v=>0.05*Math.pow(0.01,v/100);
-const sensFromGate=g=>Math.max(0,Math.min(100,Math.round(Math.log(g/0.05)/Math.log(0.01)*100)));
-$('#sensRange').value=sensFromGate(S.gate);
-$('#sensRange').oninput=e=>{S.gate=gateFromSens(+e.target.value);save();};
+const sensFromSlider=v=>6-v/100*4.6;
+const sliderFromSens=f=>Math.round((6-f)/4.6*100);
+$('#sensRange').value=sliderFromSens(S.sens);
+$('#sensRange').oninput=e=>{S.sens=sensFromSlider(+e.target.value);save();};
+$('#diagChk').checked=S.diag; $('#diag').hidden=!S.diag;
+$('#diagChk').onchange=e=>{S.diag=e.target.checked;$('#diag').hidden=!S.diag;save();};
 $('#strictChk').checked=S.strict; $('#strictChk').onchange=e=>{S.strict=e.target.checked;save();updateRecord();};
 $('#latRange').value=S.latency; $('#latOut').textContent=S.latency+' ms';
 $('#latRange').oninput=e=>{S.latency=+e.target.value;$('#latOut').textContent=S.latency+' ms';save();};
@@ -805,9 +826,8 @@ $('#calBtn').onclick=async()=>{
   calib.vals=[]; calib.on=true; $('#calTxt').textContent='Silencio 2 segundos…';
   setTimeout(()=>{
     calib.on=false; const v=calib.vals.slice().sort((a,b)=>a-b);
-    const ref=v.length?v[Math.floor(v.length*0.9)]:0.004;
-    S.gate=Math.max(0.0015,Math.min(0.03,ref*2.5)); save(); store.set('escalas:calibrated',true);
-    $('#sensRange').value=sensFromGate(S.gate); $('#calTxt').textContent='Listo, umbral ajustado.'; updateMicUI();
+    if(v.length){nf.v=v[Math.floor(v.length*0.9)];nf.init=true;}
+    $('#calTxt').textContent='Listo, ruido de fondo medido.'; updateMicUI();
   },2000);
 };
 
